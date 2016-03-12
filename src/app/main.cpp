@@ -64,6 +64,9 @@ Q_IMPORT_PLUGIN(qico)
 #endif // Q_OS_UNIX
 
 #ifdef STACKTRACE_WIN
+#include <QProcess>
+#include <QSharedMemory>
+#include <thread>
 #include <signal.h>
 #include "stacktrace_win.h"
 #include "stacktrace_win_dlg.h"
@@ -120,6 +123,50 @@ struct QBtCommandLineParameters
     }
 };
 
+QString getAppId()
+{
+    return QLatin1String("qBittorrent-") + Utils::Misc::getUserIDString();
+}
+
+#ifdef STACKTRACE_WIN
+
+const QLatin1String CRASH_HELPER_ARGUMENT("--crash-helper");
+
+QString getSharedMemoryKey()
+{
+    return getAppId() + "_shared";
+}
+
+int executeCrashHelper(int argc, char* argv[])
+{
+    HANDLE hProcess;
+    HANDLE hThread;
+    {
+        QSharedMemory mem(getSharedMemoryKey());
+        auto memGuard = straceWin::make_resource_guard([&] { mem.unlock(); mem.detach(); });
+
+        if (!mem.attach())
+            return -1;
+
+        mem.lock();
+
+        //get crashed process and thread handles
+        memcpy(reinterpret_cast<char *>(&hProcess), mem.data(), sizeof(HANDLE));
+        memcpy(reinterpret_cast<char *>(&hThread),
+            reinterpret_cast<char*>(mem.data()) + sizeof(HANDLE), sizeof(HANDLE));
+    }
+
+    QApplication application(argc, argv);
+
+    straceWin::dialog::StraceDlg dlg(hProcess);
+    dlg.setStacktraceString(straceWin::getBacktrace(hProcess, hThread));
+    dlg.show();
+
+    return application.exec();
+}
+
+#endif
+
 #ifndef DISABLE_GUI
 void showSplashScreen();
 #endif
@@ -135,8 +182,13 @@ int main(int argc, char *argv[])
     // We must save it here because QApplication constructor may change it
     bool isOneArg = (argc == 2);
 
+#ifdef STACKTRACE_WIN
+    if (isOneArg && QString(argv[argc - 1]) == CRASH_HELPER_ARGUMENT)
+        return executeCrashHelper(argc, argv);
+#endif
+
     // Create Application
-    QString appId = QLatin1String("qBittorrent-") + Utils::Misc::getUserIDString();
+    QString appId = getAppId();
     QScopedPointer<Application> app(new Application(appId, argc, argv));
 
     const QBtCommandLineParameters params = parseCommandLine();
@@ -322,6 +374,92 @@ void sigNormalHandler(int signum)
     qApp->exit();  // unsafe, but exit anyway
 }
 
+#ifdef STACKTRACE_WIN
+
+bool startCrashHelperProcess(HANDLE crashedThread)
+{
+    using namespace straceWin;
+    QProcess proc;
+    auto procGuard = make_resource_guard([&] { proc.close(); });
+
+    QSharedMemory mem(getSharedMemoryKey());
+    auto memGuard = make_resource_guard([&] { mem.unlock(); mem.detach(); });
+
+    if (mem.isAttached())
+        mem.detach();
+
+    if (!mem.create(2 * sizeof(HANDLE))) {
+        //couldn't create memory buffer
+        qDebug() << mem.errorString() << endl;
+        return false;
+    }
+
+    mem.lock();
+
+    QStringList args(CRASH_HELPER_ARGUMENT);
+    auto path = QCoreApplication::applicationFilePath();
+    proc.start(path, args);
+
+    // wait 5 minutes for a child process to start
+    if (!proc.waitForStarted(5 * 60 * 1000)) {
+        //couldn't start the process
+        auto msg = GetLastErrorString();
+        qDebug() << "waitForStarted " << msg << endl;
+        return false;
+    }
+
+    HANDLE currentProcess = OpenProcess(PROCESS_DUP_HANDLE, TRUE, GetCurrentProcessId());
+    if (!currentProcess) {
+        auto msg = GetLastErrorString();
+        qDebug() << "OpenProcess current " << msg << endl;
+        return false;
+    }
+    auto currentProcessGuard = make_resource_guard([&] { CloseHandle(currentProcess); });
+
+    HANDLE remoteProcess = OpenProcess(PROCESS_DUP_HANDLE, TRUE, proc.pid()->dwProcessId);
+    if (!remoteProcess) {
+        auto msg = GetLastErrorString();
+        qDebug() << "OpenProcess remote " << msg << endl;
+        return false;
+    }
+    auto remoteProcessGuard = make_resource_guard([&] { CloseHandle(remoteProcess); });
+
+    HANDLE hProcess;
+    if (!DuplicateHandle(currentProcess, currentProcess, remoteProcess, &hProcess,
+                         PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, TRUE, 0)) {
+        //failed to duplicate handle
+        auto msg = GetLastErrorString();
+        qDebug() << "DuplicateHandle " << msg << endl;
+        return false;
+    }
+    auto hProcessGuard = make_resource_guard([&] { CloseHandle(hProcess); });
+
+    HANDLE hThread;
+    if (!DuplicateHandle(currentProcess, crashedThread, remoteProcess, &hThread,
+                         THREAD_ALL_ACCESS, TRUE, 0)) {
+        //failed to duplicate handle
+        auto msg = GetLastErrorString();
+        qDebug() << "DuplicateHandle " << msg << endl;
+        return false;
+    }
+    auto hThreadGuard = make_resource_guard([&] { CloseHandle(hThread); });
+
+    memcpy(mem.data(), reinterpret_cast<char *>(&hProcess), sizeof(HANDLE));
+    memcpy(reinterpret_cast<char *>(mem.data()) + sizeof(HANDLE), reinterpret_cast<char *>(&hThread), sizeof(HANDLE));
+    mem.unlock();
+
+    while (!proc.waitForFinished()) {
+        if (proc.error() != QProcess::Timedout) {
+            //error occurred
+            qDebug() << "waitForFinished " << proc.error();
+            return false;
+        }
+    }
+
+    return true;
+}
+#endif
+
 void sigAbnormalHandler(int signum)
 {
 #if !defined Q_OS_WIN && !defined Q_OS_HAIKU
@@ -335,9 +473,15 @@ void sigAbnormalHandler(int signum)
     print_stacktrace();  // unsafe
 #endif // !defined Q_OS_WIN && !defined Q_OS_HAIKU
 #ifdef STACKTRACE_WIN
-    StraceDlg dlg;  // unsafe
-    dlg.setStacktraceString(straceWin::getBacktrace());
-    dlg.exec();
+
+    HANDLE hThread;
+    if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &hThread, 0,
+                        FALSE, DUPLICATE_SAME_ACCESS)) {
+        auto hThreadGuard = straceWin::make_resource_guard([&] { CloseHandle(hThread); });
+        std::thread th { startCrashHelperProcess, hThread };
+        th.join();
+    }
+
 #endif // STACKTRACE_WIN
     signal(signum, SIG_DFL);
     raise(signum);

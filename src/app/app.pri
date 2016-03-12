@@ -21,8 +21,12 @@ unix: HEADERS += $$PWD/stacktrace.h
 strace_win {
     HEADERS += $$PWD/stacktrace_win.h
     !nogui {
-        HEADERS += $$PWD/stacktrace_win_dlg.h
+        HEADERS += $$PWD/stacktrace_win_dlg.h \
+                   $$PWD/stacktrace_win_dlg_misc.h
         FORMS += $$PWD/stacktrace_win_dlg.ui
+        SOURCES += $$PWD/stacktrace_win.cpp \
+                   $$PWD/stacktrace_win_dlg.cpp \
+                   $$PWD/stacktrace_win_dlg_misc.cpp
     }
 }
 

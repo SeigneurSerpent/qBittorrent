@@ -31,50 +31,47 @@
 #define STACKTRACE_WIN_DLG_H
 
 #include <QString>
-#include <QDialog>
-#include "base/utils/misc.h"
+#include <QProgressDialog>
+#include <memory>
+#include "Windows.h"
 #include "ui_stacktrace_win_dlg.h"
 
-class StraceDlg : public QDialog, private Ui::errorDialog
+namespace straceWin
 {
-    Q_OBJECT
-
-public:
-    StraceDlg(QWidget* parent = 0)
-        : QDialog(parent)
+    namespace dialog
     {
-        setupUi(this);
+        class DumpThread;
+        class PathHelper;
+
+        class StraceDlg : public QDialog, private Ui::errorDialog
+        {
+            Q_OBJECT
+
+        private:
+            HANDLE m_hProcess;
+            QProgressDialog* m_progress;
+            DumpThread* m_thread;
+            std::unique_ptr<PathHelper> m_path;
+
+            QString chooseFilePath();
+            void saveChosenDirectoryBetweenCalls(const QString& path);
+            
+        public:
+            StraceDlg( HANDLE hProcess, QWidget* parent = 0);
+            void setStacktraceString(const QString& trace);
+
+            ~StraceDlg();
+        public slots:
+            void saveDump();
+
+        private slots:
+            void compress_changed(int state);
+
+            void cancelTask();
+            void closeProgress();
+            void reportError(const QString& errMsg);
+        };
     }
+}
+#endif // STACKTRACE_WIN_DLG_H
 
-    void setStacktraceString(const QString& trace)
-    {
-        // try to call Qt function as less as possible
-        QString htmlStr = QString(
-            "<p align=center><b><font size=7 color=red>"
-            "qBittorrent has crashed"
-            "</font></b></p>"
-            "<font size=4><p>"
-            "Please file a bug report at "
-            "<a href=\"http://bugs.qbittorrent.org\">http://bugs.qbittorrent.org</a> "
-            "and provide the following information:"
-            "</p></font>"
-            "<br/><hr><br/>"
-            "<p align=center><font size=4>"
-            "qBittorrent version: " VERSION "<br/>"
-            "Libtorrent version: %1<br/>"
-            "Qt version: " QT_VERSION_STR "<br/>"
-            "Boost version: %2<br/>"
-            "OS version: %3"
-            "</font></p><br/>"
-            "<pre><code>%4</code></pre>"
-            "<br/><hr><br/><br/>")
-            .arg(Utils::Misc::libtorrentVersionString())
-            .arg(Utils::Misc::boostVersionString())
-            .arg(Utils::Misc::osName())
-            .arg(trace);
-
-        errorText->setHtml(htmlStr);
-    }
-};
-
-#endif
